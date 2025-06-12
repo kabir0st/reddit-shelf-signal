@@ -1,5 +1,6 @@
+import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from praw.models import MoreComments
 from prawcore.exceptions import Forbidden, RequestException, ResponseException
@@ -11,7 +12,7 @@ def get_time_filter(days_back):
         return "day"
     if days_back <= 7:
         return "week"
-    if days_back <= 31:  # Use 31 to safely cover a month
+    if days_back <= 31:
         return "month"
     if days_back <= 365:
         return "year"
@@ -21,9 +22,9 @@ def get_time_filter(days_back):
 def search_reddit_for_keyword(reddit_instance,
                               subs,
                               target_phrases,
-                              days_back=1000):
+                              days_back=30):
     """
-    Search Reddit comprehensively for posts and comments with target phrases.
+    Search Reddit comprehensively and save detailed results to a JSON file.
 
     Args:
         reddit_instance: Authenticated PRAW Reddit instance.
@@ -32,55 +33,50 @@ def search_reddit_for_keyword(reddit_instance,
         days_back: Number of days back to search (default: 30).
 
     Returns:
-        A list of dictionaries containing search results.
+        A list of dictionaries containing detailed search results.
     """
-    date_threshold = datetime.now() - timedelta(days=days_back)
+    date_threshold = datetime.now(timezone.utc) - timedelta(days=days_back)
     date_threshold_timestamp = date_threshold.timestamp()
-    time_filter = get_time_filter(days_back)
     search_query = " OR ".join(f'"{phrase}"' for phrase in target_phrases)
 
     print("Searching Reddit for posts and comments...")
-    print(
-        f"Date filter: Items from {date_threshold.strftime('%Y-%m-%d')} onwards"
-    )
+    print(f"Date filter: Items from {date_threshold.strftime('%Y-%m-%d')}"
+          " onwards")
     print(f"Subreddits: {', '.join(subs)}")
     print(f"Target phrases: {', '.join(target_phrases)}")
     print("-" * 80)
 
     all_results = []
-    seen_urls = set()  # Use a set for efficient de-duplication
+    seen_ids = set()  # Use ID for de-duplication (more robust than URL)
 
     def add_result(result):
         """Add a result if it hasn't been seen before."""
-        if result["url"] not in seen_urls:
+        if result["id"] not in seen_ids:
             all_results.append(result)
-            seen_urls.add(result["url"])
+            seen_ids.add(result["id"])
             return True
         return False
 
-    # EXPANDED: Search using multiple sort methods to cast a wider net
     search_sorts = ["relevance", "new", "comments"]
 
     for subreddit_name in subs:
         print(f"\n🔍 Searching in r/{subreddit_name}...")
-        found_in_sub_overall = False
         try:
             subreddit = reddit_instance.subreddit(subreddit_name)
             for sort_method in search_sorts:
-                print(
-                    f"  📋 Searching submissions (sort: {sort_method}, time: {time_filter})..."
-                )
+                time_filter = get_time_filter(days_back)
+                print(f"  📋 Searching submissions (sort: {sort_method}, "
+                      f"time: {time_filter})...")
                 submissions = subreddit.search(
                     query=search_query,
                     sort=sort_method,
                     time_filter=time_filter,
-                    limit=150,  # Increased limit for a wider search
+                    limit=150,
                 )
 
                 for submission in submissions:
                     if submission.created_utc < date_threshold_timestamp:
                         continue
-                    found_in_sub_overall = True
 
                     # 1. Process the Submission itself
                     sub_match_data = check_text_for_phrases(
@@ -88,12 +84,11 @@ def search_reddit_for_keyword(reddit_instance,
                         target_phrases,
                     )
                     if sub_match_data["matches"]:
-                        result = create_submission_result(
+                        result = create_submission_json_result(
                             submission, sub_match_data)
                         if add_result(result):
                             print(
-                                f"    ✅ Found in submission: {submission.title[:60]}..."
-                            )
+                                f"    ✅ Found in submission: {submission.id}")
 
                     # 2. Process all comments within the submission
                     try:
@@ -106,23 +101,15 @@ def search_reddit_for_keyword(reddit_instance,
                             comment_match_data = check_text_for_phrases(
                                 comment.body, target_phrases)
                             if comment_match_data["matches"]:
-                                result = create_comment_result(
+                                result = create_comment_json_result(
                                     comment, comment_match_data)
                                 if add_result(result):
-                                    print(
-                                        f"      ✅ Found in comment by u/{result['author']}"
-                                    )
+                                    print("      ✅ Found in comment: "
+                                          f"{comment.id}")
                     except Exception as e:
-                        print(
-                            f"      ❌ Error processing comments for {submission.id}: {e}"
-                        )
-                time.sleep(2)  # Rate limiting between different sort API calls
-
-            if not found_in_sub_overall:
-                print(
-                    "  -> No submissions found matching criteria in this subreddit."
-                )
-
+                        print(f"      ❌ Error processing comments"
+                              f" for {submission.id}: {e}")
+                time.sleep(2)
         except (RequestException, ResponseException, Forbidden) as e:
             print(f"❌ API error searching r/{subreddit_name}: {e}")
             time.sleep(10)
@@ -131,6 +118,7 @@ def search_reddit_for_keyword(reddit_instance,
             time.sleep(5)
 
     display_results(all_results)
+    save_results_to_json(all_results, target_phrases)
     return all_results
 
 
@@ -149,7 +137,7 @@ def check_text_for_phrases(text, target_phrases):
         phrase for phrase in target_phrases if phrase.lower() in text_lower
     ]
 
-    preview = text[:200] + "..." if len(text) > 200 else text
+    preview = ""
     if matches:
         first_match_lower = matches[0].lower()
         match_pos = text_lower.find(first_match_lower)
@@ -157,110 +145,140 @@ def check_text_for_phrases(text, target_phrases):
             start = max(0, match_pos - 70)
             end = min(len(text), match_pos + len(first_match_lower) + 70)
             preview = f"...{text[start:end]}..."
-    return {"matches": matches, "context": preview.replace("\n", " ")}
+    return {"matches": matches, "context_preview": preview.replace("\n", " ")}
 
 
-def create_submission_result(submission, match_data):
-    """Create a result dictionary for a submission."""
+def create_submission_json_result(submission, match_data):
+    """Create a detailed result dictionary for a submission."""
+    author_name = str(submission.author) if submission.author else "[deleted]"
     return {
         "type":
         "submission",
+        "id":
+        submission.id,
+        "matching_phrases":
+        match_data["matches"],
+        "context_preview":
+        match_data["context_preview"],
         "subreddit":
         submission.subreddit.display_name,
         "title":
         submission.title,
-        "author":
-        str(submission.author) if submission.author else "[deleted]",
-        "created":
-        datetime.fromtimestamp(submission.created_utc),
+        "author_name":
+        author_name,
+        "created_utc":
+        submission.created_utc,
+        "created_iso":
+        datetime.fromtimestamp(submission.created_utc,
+                               tz=timezone.utc).isoformat(),
         "url":
         f"https://reddit.com{submission.permalink}",
         "score":
         submission.score,
+        "upvote_ratio":
+        submission.upvote_ratio,
         "num_comments":
         submission.num_comments,
-        "matching_phrases":
-        match_data["matches"],
-        "text_preview":
-        match_data["context"],
+        "is_self":
+        submission.is_self,
+        "stickied":
+        submission.stickied,
+        "locked":
+        submission.locked,
         "full_text": (f"{submission.title}\n\n{submission.selftext}"
-                      if submission.selftext else submission.title),
+                      if submission.is_self else submission.url),
     }
 
 
-def create_comment_result(comment, match_data):
-    """Create a result dictionary for a comment."""
+def create_comment_json_result(comment, match_data):
+    """Create a detailed result dictionary for a comment."""
+    author_name = str(comment.author) if comment.author else "[deleted]"
     return {
-        "type": "comment",
-        "subreddit": comment.subreddit.display_name,
-        "title": f"Comment on: {comment.submission.title[:60]}...",
-        "author": str(comment.author) if comment.author else "[deleted]",
-        "created": datetime.fromtimestamp(comment.created_utc),
-        "url": f"https://reddit.com{comment.permalink}",
-        "score": comment.score,
-        "matching_phrases": match_data["matches"],
-        "text_preview": match_data["context"],
-        "parent_submission": comment.submission.title,
-        "full_text": comment.body,
+        "type":
+        "comment",
+        "id":
+        comment.id,
+        "matching_phrases":
+        match_data["matches"],
+        "context_preview":
+        match_data["context_preview"],
+        "subreddit":
+        comment.subreddit.display_name,
+        "parent_submission_id":
+        comment.submission.id,
+        "parent_submission_title":
+        comment.submission.title,
+        "author_name":
+        author_name,
+        "created_utc":
+        comment.created_utc,
+        "created_iso":
+        datetime.fromtimestamp(comment.created_utc,
+                               tz=timezone.utc).isoformat(),
+        "url":
+        f"https://reddit.com{comment.permalink}",
+        "score":
+        comment.score,
+        "depth":
+        comment.depth,
+        "is_submitter":
+        comment.is_submitter,
+        "stickied":
+        comment.stickied,
+        "locked":
+        comment.locked,
+        "full_text":
+        comment.body,
     }
 
 
 def display_results(results):
-    """Display the search results in a formatted way."""
+    """Display a summary of the search results in the console."""
     if not results:
         print("\n❌ No results found matching the criteria.")
         return
 
     print(f"\n🎉 Found {len(results)} total unique results:")
     print("=" * 80)
-    results.sort(key=lambda x: (-x["score"], x["created"]), reverse=True)
+    results.sort(key=lambda x: (-x["score"], x["created_utc"]), reverse=True)
     for i, result in enumerate(results, 1):
+        created_dt = datetime.fromisoformat(result['created_iso'])
+        title = result.get(
+            'title', f"Comment on: "
+            f"{result.get('parent_submission_title', 'N/A')[:60]}...")
         print(f"\n{i}. [{result['type'].upper()}] r/{result['subreddit']}")
-        print(f"   📝 {result['title']}")
-        print(f"   👤 u/{result['author']}"
-              f" | 📅 {result['created'].strftime('%Y-%m-%d %H:%M')}"
+        print(f"   📝 {title}")
+        print(f"   👤 u/{result['author_name']}"
+              f" | 📅 {created_dt.strftime('%Y-%m-%d %H:%M')}"
               f" | ⬆️ {result['score']}")
         print(
             f"   🎯 Matched Keyword(s): {', '.join(result['matching_phrases'])}"
         )
-        print(f"   📄 Preview: {result['text_preview']}")
+        print(f"   📄 Preview: {result['context_preview']}")
         print(f"   🔗 {result['url']}")
-        if result["type"] == "comment":
-            print(f"   📋 Parent post: {result['parent_submission']}")
 
 
-def save_results_to_file(results, filename="reddit_search_results.txt"):
-    """Save search results to a text file with improved formatting."""
+def save_results_to_json(results,
+                         target_phrases,
+                         filename="reddit_search_results.json"):
+    """Save detailed search results to a structured JSON file."""
     if not results:
         print("\n💾 No results to save.")
         return
 
-    all_phrases = set(p for r in results for p in r["matching_phrases"])
+    # Sort results by score for the final file
+    results.sort(key=lambda x: (-x["score"], x["created_utc"]), reverse=True)
+
+    output_data = {
+        "metadata": {
+            "search_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "target_phrases": target_phrases,
+            "total_results": len(results),
+        },
+        "results": results,
+    }
 
     with open(filename, "w", encoding="utf-8") as f:
-        f.write("Reddit Search Results - "
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Found {len(results)} results for phrases: "
-                f"{', '.join(sorted(list(all_phrases)))}\n")
-        f.write("=" * 80 + "\n\n")
-
-        for i, result in enumerate(results, 1):
-            f.write(
-                f"{i}. [{result['type'].upper()}] r/{result['subreddit']}\n")
-            f.write(f"   Title: {result['title']}\n")
-            f.write(f"   Author: u/{result['author']}\n")
-            f.write(
-                f"   Date: {result['created'].strftime('%Y-%m-%d %H:%M')}\n")
-            f.write(f"   Score: {result['score']}\n")
-            if result.get("num_comments") is not None:
-                f.write(f"   Comments: {result['num_comments']}\n")
-            f.write(
-                f"   Matched Keyword(s): {', '.join(result['matching_phrases'])}\n"
-            )
-            f.write(f"   URL: {result['url']}\n")
-            f.write(f"   Preview:\n{result['text_preview']}\n")
-            if result["type"] == "comment":
-                f.write(f"   Parent post: {result['parent_submission']}\n")
-            f.write("\n" + "-" * 80 + "\n\n")
+        json.dump(output_data, f, indent=4, ensure_ascii=False)
 
     print(f"\n💾 Results saved to {filename}")

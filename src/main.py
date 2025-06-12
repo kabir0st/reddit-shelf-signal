@@ -3,7 +3,7 @@ import os
 import praw
 from dotenv import load_dotenv
 
-from libs.utils import save_results_to_file, search_reddit_for_keyword
+from libs.utils import save_results_to_json, search_reddit_for_keyword
 
 
 def main():
@@ -23,12 +23,13 @@ def main():
     ]
 
     target_phrases = [
-        'where to buy books', 'booksmandala', 'books mandala',
-        'book store in nepal', 'online books', 'where can i get this book',
-        'buy books online', 'book delivery nepal', 'nepali bookstore'
+        'where to buy books', "bookstores", 'online book', 'pdf book',
+        'booksmandala', 'books mandala', 'book store in nepal', 'online books',
+        'where can i get this book', 'buy books online', 'book delivery nepal',
+        'nepali bookstore'
     ]
     results = search_reddit_for_keyword(reddit, subs, target_phrases)
-    save_results_to_file(results, "book_mentions.txt")
+    save_results_to_json(results, "book_mentions.txt")
 
 
 if __name__ == "__main__":
