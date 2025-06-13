@@ -2,6 +2,7 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 
+import requests
 from praw.models import MoreComments
 from prawcore.exceptions import Forbidden, RequestException, ResponseException
 
@@ -282,3 +283,279 @@ def save_results_to_json(results,
         json.dump(output_data, f, indent=4, ensure_ascii=False)
 
     print(f"\n💾 Results saved to {filename}")
+
+
+def search_reddit_for_keyword_incremental(reddit_instance,
+                                          subs,
+                                          target_phrases,
+                                          last_timestamp,
+                                          existing_data=None):
+    """
+    Search Reddit for new content since the last timestamp.
+    
+    Args:
+        reddit_instance: Authenticated PRAW Reddit instance.
+        subs: List of subreddits to search.
+        target_phrases: List of phrases to search for.
+        last_timestamp: Unix timestamp of last data pull.
+        existing_data: Previously saved data to merge with.
+    
+    Returns:
+        List of new results found since last timestamp.
+    """
+    # Convert timestamp to datetime for filtering
+    date_threshold = datetime.fromtimestamp(last_timestamp, tz=timezone.utc)
+    search_query = " OR ".join(f'"{phrase}"' for phrase in target_phrases)
+
+    print("Searching Reddit for new posts and comments...")
+    print(f"Looking for content after: {date_threshold.isoformat()}")
+    print(f"Subreddits: {', '.join(subs)}")
+    print(f"Target phrases: {', '.join(target_phrases)}")
+    print("-" * 80)
+
+    new_results = []
+    existing_ids = set()
+
+    # Get existing IDs to avoid duplicates
+    if existing_data and "results" in existing_data:
+        existing_ids = {result["id"] for result in existing_data["results"]}
+        print(f"Found {len(existing_ids)} existing results to check against")
+
+    def add_new_result(result):
+        """Add a result if it's new and not already seen."""
+        if result["id"] not in existing_ids:
+            new_results.append(result)
+            existing_ids.add(result["id"])
+            return True
+        return False
+
+    search_sorts = ["new", "relevance"]  # Prioritize new content
+
+    for subreddit_name in subs:
+        print(f"\n🔍 Searching in r/{subreddit_name}...")
+        try:
+            subreddit = reddit_instance.subreddit(subreddit_name)
+            for sort_method in search_sorts:
+                print(f"  📋 Searching submissions (sort: {sort_method})...")
+                submissions = subreddit.search(
+                    query=search_query,
+                    sort=sort_method,
+                    time_filter="week",  # Look at recent content
+                    limit=100,
+                )
+
+                for submission in submissions:
+                    # Only process if newer than last timestamp
+                    if submission.created_utc <= last_timestamp:
+                        continue
+
+                    # Process the submission
+                    sub_match_data = check_text_for_phrases(
+                        f"{submission.title} {submission.selftext or ''}",
+                        target_phrases,
+                    )
+                    if sub_match_data["matches"]:
+                        result = create_submission_json_result(
+                            submission, sub_match_data)
+                        if add_new_result(result):
+                            print(f"    ✅ NEW submission: {submission.id}")
+
+                    # Process comments in the submission
+                    try:
+                        submission.comments.replace_more(limit=None)
+                        for comment in submission.comments.list():
+                            if isinstance(comment, MoreComments):
+                                continue
+                            if comment.created_utc <= last_timestamp:
+                                continue
+
+                            comment_match_data = check_text_for_phrases(
+                                comment.body, target_phrases)
+                            if comment_match_data["matches"]:
+                                result = create_comment_json_result(
+                                    comment, comment_match_data)
+                                if add_new_result(result):
+                                    print(f"      ✅ NEW comment: {comment.id}")
+                    except Exception as e:
+                        print(f"      ❌ Error processing comments for "
+                              f"{submission.id}: {e}")
+
+                time.sleep(2)
+        except (RequestException, ResponseException, Forbidden) as e:
+            print(f"❌ API error searching r/{subreddit_name}: {e}")
+            time.sleep(10)
+        except Exception as e:
+            print(f"❌ Unexpected error in r/{subreddit_name}: {e}")
+            time.sleep(5)
+
+    # Update and save the complete dataset
+    if new_results:
+        print(f"\n🎉 Found {len(new_results)} new results!")
+        save_updated_results(existing_data, new_results, target_phrases)
+    else:
+        print("\n✅ No new results found.")
+        # Still update the timestamp even if no new results
+        update_timestamp_only(existing_data, target_phrases)
+
+    return new_results
+
+
+def save_updated_results(existing_data,
+                         new_results,
+                         target_phrases,
+                         filename="reddit_search_results.json"):
+    """Save updated results with new data and timestamp."""
+    current_time = datetime.now(timezone.utc)
+
+    # Combine existing and new results
+    all_results = []
+    if existing_data and "results" in existing_data:
+        all_results.extend(existing_data["results"])
+    all_results.extend(new_results)
+
+    # Sort by score and creation time
+    all_results.sort(key=lambda x: (-x["score"], x["created_utc"]),
+                     reverse=True)
+
+    # Create updated data structure
+    output_data = {
+        "metadata": {
+            "search_timestamp_utc": current_time.isoformat(),
+            "last_data_pull_timestamp_utc": current_time.isoformat(),
+            "target_phrases": target_phrases,
+            "total_results": len(all_results),
+            "new_results_count": len(new_results),
+        },
+        "results": all_results,
+    }
+
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(output_data, f, indent=4, ensure_ascii=False)
+
+    print(f"\n💾 Updated results saved to {filename}")
+    print(f"   Total results: {len(all_results)}")
+    print(f"   New results: {len(new_results)}")
+
+
+def update_timestamp_only(existing_data,
+                          target_phrases,
+                          filename="reddit_search_results.json"):
+    """Update only the timestamp when no new results are found."""
+    current_time = datetime.now(timezone.utc)
+
+    if existing_data:
+        existing_data["metadata"]["last_data_pull_timestamp_utc"] = (
+            current_time.isoformat())
+        existing_data["metadata"]["search_timestamp_utc"] = (
+            current_time.isoformat())
+
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(existing_data, f, indent=4, ensure_ascii=False)
+
+        print(f"\n💾 Timestamp updated in {filename}")
+
+
+def send_discord_notification(new_results, webhook_url):
+    """Send Discord webhook notification for new results."""
+    if not new_results:
+        return
+
+    # Create embeds for each new result (limit to 10 to avoid message limits)
+    embeds = []
+    for result in new_results[:10]:
+        # Determine color based on type and score
+        color = 0x00ff00 if result["type"] == "submission" else 0x0099ff
+        if result["score"] >= 5:
+            color = 0xff6600  # Orange for high-scoring content
+
+        # Create embed
+        embed = {
+            "title":
+            f"🔍 New {result['type'].title()} Found!",
+            "color":
+            color,
+            "timestamp":
+            result["created_iso"],
+            "fields": [{
+                "name": "📍 Subreddit",
+                "value": f"r/{result['subreddit']}",
+                "inline": True
+            }, {
+                "name": "👤 Author",
+                "value": f"u/{result['author_name']}",
+                "inline": True
+            }, {
+                "name": "⬆️ Score",
+                "value": str(result['score']),
+                "inline": True
+            }, {
+                "name": "🎯 Matched Keywords",
+                "value": ", ".join(result['matching_phrases']),
+                "inline": False
+            }, {
+                "name":
+                "📄 Content Preview",
+                "value":
+                result['context_preview'][:500] +
+                "..." if len(result['context_preview']) > 500 else
+                result['context_preview'],
+                "inline":
+                False
+            }],
+            "footer": {
+                "text": "BooksMandala Reddit Monitor"
+            }
+        }
+
+        # Add title field for submissions or parent info for comments
+        if result["type"] == "submission":
+            embed["fields"].insert(
+                3, {
+                    "name":
+                    "📝 Title",
+                    "value":
+                    result['title'][:100] +
+                    "..." if len(result['title']) > 100 else result['title'],
+                    "inline":
+                    False
+                })
+        else:
+            embed["fields"].insert(
+                3, {
+                    "name":
+                    "💬 Comment on",
+                    "value":
+                    result['parent_submission_title'][:100] +
+                    "..." if len(result['parent_submission_title']) > 100 else
+                    result['parent_submission_title'],
+                    "inline":
+                    False
+                })
+
+        # Add URL as a button-like field
+        embed["fields"].append({
+            "name": "🔗 View on Reddit",
+            "value": f"[Click here]({result['url']})",
+            "inline": False
+        })
+
+        embeds.append(embed)
+
+    # Create the main message
+    content = (f"🚨 **BooksMandala Alert!** "
+               f"Found {len(new_results)} new mention(s)!")
+    if len(new_results) > 10:
+        content += (f"\n*Showing first 10 results."
+                    f" {len(new_results) - 10} more found.*")
+
+    payload = {"content": content, "embeds": embeds}
+
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=30)
+        if response.status_code == 204:
+            print("✅ Discord notification sent successfully!")
+        else:
+            print(f"❌ Discord notification failed: {response.status_code}")
+            print(f"Response: {response.text}")
+    except Exception as e:
+        print(f"❌ Error sending Discord notification: {e}")

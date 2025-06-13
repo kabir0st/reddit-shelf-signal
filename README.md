@@ -12,7 +12,9 @@ This project is a Python-based Reddit bot designed to scan specified subreddits 
 -   Searches multiple subreddits.
 -   Looks for a configurable list of keywords and phrases.
 -   Authenticates with Reddit using API credentials.
--   Saves found mentions to a local file (`book_mentions.txt`).
+-   Saves found mentions to a local file (`reddit_search_results.json`).
+-   Sends notifications to Discord for new mentions.
+-   Performs incremental searches to only fetch new data since the last run.
 -   Easy to configure and run.
 
 ## 🛠️ Getting Started
@@ -34,15 +36,13 @@ Follow these steps to get the bot up and running on your local machine.
     This project uses `uv` for package management. If you have `uv` installed, you can create a virtual environment and install dependencies from [`pyproject.toml`](pyproject.toml:0):
     ```bash
     uv venv
-    uv pip install -r requirements.txt 
-    # or if pyproject.toml is configured for it:
-    # uv pip install . 
+    uv pip install .
     ```
-    Alternatively, if you prefer using `pip`:
+    Alternatively, if you prefer using `pip` (though `uv` is recommended):
     ```bash
     python -m venv .venv
     source .venv/bin/activate  # On Windows use `.venv\Scripts\activate`
-    pip install praw python-dotenv
+    pip install -e .
     ```
 
 3.  **Set up Environment Variables:**
@@ -52,8 +52,9 @@ Follow these steps to get the bot up and running on your local machine.
     CLIENT_SECRET="YOUR_REDDIT_CLIENT_SECRET"
     USER_PASSWORD="YOUR_REDDIT_USER_PASSWORD"
     USER_NAME="YOUR_REDDIT_USERNAME"
+    DISCORD_WEBHOOK_URL="YOUR_DISCORD_WEBHOOK_URL" # Optional: for Discord notifications
     ```
-    Replace the placeholder values with your actual Reddit API details. You can obtain these by creating a new "script" app on Reddit's [app preferences page](https://www.reddit.com/prefs/apps).
+    Replace the placeholder values with your actual Reddit API details. You can obtain these by creating a new "script" app on Reddit's [app preferences page](https://www.reddit.com/prefs/apps). The `DISCORD_WEBHOOK_URL` can be obtained from your Discord server's webhook settings.
 
 ### ▶️ Running the Bot
 
@@ -63,7 +64,7 @@ Once the setup is complete, you can run the bot using the following command:
 python main.py
 ```
 
-The bot will log in to Reddit and start searching the configured subreddits for the target phrases. Any matches found will be saved in the [`book_mentions.txt`](book_mentions.txt:0) file in the project's root directory.
+The bot will log in to Reddit and start searching the configured subreddits for the target phrases. Any matches found will be saved incrementally in the `reddit_search_results.json` file in the project's root directory. If `DISCORD_WEBHOOK_URL` is configured, new results will also be sent as notifications to the specified Discord channel.
 
 ## 📋 Configuration
 
@@ -95,13 +96,15 @@ You can customize the bot's behavior by modifying the following in [`main.py`](m
 .
 ├── .gitignore
 ├── .python-version
-├── book_mentions.txt   # Output file for mentions
-├── main.py             # Main script to run the bot
 ├── pyproject.toml      # Project metadata and dependencies
 ├── README.md           # This file
+├── reddit_search_results.json # Output file for mentions (created after first run)
 ├── uv.lock             # uv lock file
-└── libs/
-    └── utils.py        # Utility functions for Reddit search and saving results
+├── src/
+│   ├── .env.example    # Example environment variables file
+│   ├── main.py         # Main script to run the bot
+│   └── libs/
+│       └── utils.py    # Utility functions for Reddit search and saving results
 ```
 
 ## 🤝 Contributing
